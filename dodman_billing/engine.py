@@ -22,17 +22,23 @@ from dodman_billing.hooks import EntitlementHooks
 from dodman_billing.notifications import EmailSender, NullEmailSender, resolve_period_dates, parse_dt
 from dodman_billing.emails import build_invoice_html, build_invoice_pdf, build_lifecycle_email_html
 from dodman_billing.errors import BillingError
+from typing import Any
 
 log = logging.getLogger(__name__)
 
 ResolveUserByEmail = Callable[[str], Awaitable[str | None]]
+AuditLogFn = Callable[..., Awaitable[None]]
+
+
+async def _noop_audit_log(*args: Any, **kwargs: Any) -> None:
+    return None
 
 
 class BillingEngine:
     def __init__(self, *, config: BillingConfig, plans: PlanRegistry, repository: SubscriptionRepository,
                  paystack: PaystackClientProtocol, hooks: EntitlementHooks,
                  resolve_user_by_email: ResolveUserByEmail, resolve_email_by_user_id: ResolveUserByEmail,
-                 email_sender: EmailSender | None = None):
+                 email_sender: EmailSender | None = None, audit_log: AuditLogFn | None = None):
         self.config = config
         self.plans = plans
         self.repo = repository
@@ -41,6 +47,15 @@ class BillingEngine:
         self.resolve_user_by_email = resolve_user_by_email
         self.resolve_email_by_user_id = resolve_email_by_user_id
         self.emails = email_sender or NullEmailSender()
+        self.audit_log = audit_log or _noop_audit_log
+
+    async def _log(self, event: str, success: bool, *, user_type: str = "user", target_type: str = "subscription",
+                    target_id: str = "", ip_address: str = "", details: dict | None = None) -> None:
+        try:
+            await self.audit_log(event, success, user_type=user_type, target_type=target_type,
+                                  target_id=target_id, ip_address=ip_address, details=details or {})
+        except Exception:
+            log.exception("Audit log call failed for event=%s (billing logic still proceeded)", event)
 
     # ------------------------------------------------------------------
     # Outbound notifications
@@ -131,7 +146,8 @@ class BillingEngine:
         await self._activate_from_transaction(tx, user_id=user_id, cust_email=cust_email)
         return {"outcome": "success", "reason": ""}
 
-    async def _activate_from_transaction(self, tx: dict, *, user_id: str, cust_email: str) -> None:
+    async def _activate_from_transaction(self, tx: dict, *, user_id: str, cust_email: str,
+                                           event_name: str = "billing.subscribed", ip_address: str = "") -> None:
         sub = tx.get("subscription", {}) or {}
         plan_obj = tx.get("plan", {}) or {}
         if isinstance(plan_obj, str):
@@ -164,6 +180,8 @@ class BillingEngine:
             paid_at=tx.get("paid_at") or tx.get("paidAt") or "",
             period_start=period_start_str, period_end=period_end_str,
         )
+        await self._log(event_name, True, target_id=user_id, ip_address=ip_address,
+                         details={"plan": plan_key, "plan_code": plan_code, "reference": tx.get("reference", "")})
 
     async def _maybe_disable_prior_subscription(self, tx_metadata: dict, user_id: str) -> None:
         """If this checkout was tagged as a plan change (see change_plan), disable the
@@ -241,7 +259,8 @@ class BillingEngine:
             await handler(data, user_id=user_id, cust_email=cust_email)
 
     async def _on_charge_success(self, data: dict, *, user_id: str, cust_email: str) -> None:
-        await self._activate_from_transaction(data, user_id=user_id, cust_email=cust_email)
+        await self._activate_from_transaction(data, user_id=user_id, cust_email=cust_email,
+                                                event_name="billing.charge_success", ip_address="paystack-webhook")
 
     async def _on_subscription_create(self, data: dict, *, user_id: str, cust_email: str) -> None:
         plan_obj = data.get("plan", {}) or {}
@@ -269,6 +288,8 @@ class BillingEngine:
                   f"<p>You can manage your subscription and view invoices from your dashboard.</p>"),
             cta_text="Go to Dashboard", cta_url=self._dashboard_url(),
         )
+        await self._log("billing.subscription_created", True, target_id=user_id, ip_address="paystack-webhook",
+                         details={"plan": plan_key})
 
     async def _on_subscription_disable(self, data: dict, *, user_id: str, cust_email: str) -> None:
         async with self.repo.transaction() as conn:
@@ -280,6 +301,8 @@ class BillingEngine:
             body="<p>Your subscription has been cancelled. You can re-subscribe at any time.</p>",
             cta_text="Re-subscribe", cta_url=self._dashboard_url(),
         )
+        await self._log("billing.subscription_cancelled", True, target_id=user_id, ip_address="paystack-webhook",
+                         details={"new_status": "cancelled"})
 
     async def _on_subscription_not_renew(self, data: dict, *, user_id: str, cust_email: str) -> None:
         async with self.repo.transaction() as conn:
@@ -301,6 +324,8 @@ class BillingEngine:
                   "<p>Please update your payment method to avoid losing access.</p>"),
             cta_text="Update Payment Method", cta_url=self._dashboard_url(),
         )
+        await self._log("billing.payment_failed", False, target_id=user_id, ip_address="paystack-webhook",
+                         details={"amount": data.get("amount")})
 
     # ------------------------------------------------------------------
     # Manual verify (missed callback recovery)
@@ -655,6 +680,8 @@ class BillingEngine:
                                 heading="Plan Switched", body=f"<p>Your scheduled downgrade to the {new_plan_key.title()} plan is now active.</p>",
                                 cta_text="View Dashboard", cta_url=self._dashboard_url(),
                             )
+                        await self._log("billing.downgrade_applied", True, user_type="system", target_id=str(user_id),
+                                         ip_address="reconciliation-job", details={"new_plan": new_plan_key})
                 except Exception:
                     log.exception("Scheduled downgrade charge failed for user=%s", user_id)
 
@@ -670,6 +697,8 @@ class BillingEngine:
                               "complete the charge automatically. Your access has been paused.</p>"),
                         cta_text="Re-subscribe", cta_url=self._dashboard_url(),
                     )
+                await self._log("billing.downgrade_failed", False, user_type="system", target_id=str(user_id),
+                                 ip_address="reconciliation-job", details={"attempted_plan": new_plan_key})
 
     async def enforce_payment_grace_periods(self) -> None:
         """Revokes access for subscriptions whose grace period has expired,
@@ -708,3 +737,5 @@ class BillingEngine:
                           "account, so access has been suspended.</p><p>Re-subscribe at any time to restore access.</p>"),
                     cta_text="Re-subscribe", cta_url=self._dashboard_url(),
                 )
+            await self._log("billing.access_revoked_grace_expired", True, user_type="system", target_id=str(user_id),
+                             ip_address="reconciliation-job", details={"prior_status": row["status"]})

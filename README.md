@@ -85,7 +85,25 @@ identity model doesn't fit that shape, `resolve_user_by_email` and
 `resolve_email_by_user_id` on `BillingEngine` are just plain async
 callables - swap in your own.
 
-## Wiring examples
+## Tried against Vett's real code (not a guess)
+
+You uploaded the full `main.py` (6,353 lines). Reading it changed real things:
+
+**What matched my earlier stand-ins closely enough to use as-is:** `_error_envelope(code, message, request_id, extra=None)`, `_client_ip(request)`, `verify_internal_secret`, `get_current_user`'s return shape.
+
+**A real bug in the package itself, found only by testing against your actual schema:** `subscriptions` already exists in production with `CREATE UNIQUE INDEX idx_sub_user ON subscriptions (user_id)` - a real, named, live index. My original `init_schema()` only knew how to create a table from scratch; against your existing one, `CREATE TABLE IF NOT EXISTS` silently no-ops, and the very next statement (`ALTER TABLE ... ENABLE ROW LEVEL SECURITY` referencing a `product` column that doesn't exist yet) would have crashed outright on first deploy.
+
+**A more serious design flaw, found by testing the migration itself, not just describing it:** my first fix added the `product` column and enabled RLS in the same automatic `init_schema()` call. That creates a real blackout window - the instant RLS turns on, every existing row (still `product=''`, not yet backfilled) becomes invisible to a `product='vett'`-scoped read, meaning **every existing paying subscriber would appear to have no active subscription** until the separate backfill step ran. Fixed by splitting this properly: `init_schema()` now detects unmigrated rows and refuses to enable RLS until they're gone; the backfill and RLS activation happen together, atomically, in `migrate_legacy_single_tenant_table()` - never as two steps that could be separated in time.
+
+**Proven against your exact legacy schema, not a clean-room assumption:** `tests/test_vett_migration.py` builds a database from your `subscriptions` `CREATE TABLE` statement verbatim (UUID PK, `idx_sub_user`, the works), seeds it with realistic existing subscribers, and confirms: `init_schema()` is purely additive and holds off on RLS correctly; a dry run changes nothing; the real migration backfills every row, drops the legacy index, and enables RLS as one atomic step; all existing subscriber data survives intact; and - the actual point - a second product can now successfully subscribe a user who already has a Vett subscription, which would have raised a unique-violation error before.
+
+**A runnable migration script**, not just library calls: `examples/vett_migration_script.py`. Dry-run by default, requires a typed `yes` confirmation for the real run, reports exactly what changed. I ran it for real against the seeded legacy database (included above) and it worked end-to-end.
+
+**One change that has to happen in your `main.py`, not this package:** `get_current_user` (around line 1889) does its own direct `LEFT JOIN subscriptions s ON s.user_id = u.id`, independent of the billing router entirely. Once a second product's rows can exist for the same user, this needs `AND s.product = 'vett'` or it could return an arbitrary product's row into a Vett session. Harmless today (only Vett has rows), stops being harmless the moment that changes - the migration script prints this reminder at the end of a real run.
+
+**Another structural change, also in `main.py`:** your real `billing_router = APIRouter(prefix="/billing", tags=["billing"])` (line 2270) is built at *module import time*, with routes using `Depends(get_pool)` per-request. This package's `build_billing_router()` needs a fully-constructed `engine` (which needs a live `pool`) up front, so router construction has to move into your `@app.on_event("startup")` handler - after `_pool = await asyncpg.create_pool(...)` runs (around line 800) - rather than happening at import time. That's the one piece of `app.py`'s structure that needs to change, not just a file swap.
+
+
 
 - `examples/vett_wiring.py` - Vett's actual plan structure and entitlement
   model, side-by-side with what the original router did
