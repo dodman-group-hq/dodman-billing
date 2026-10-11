@@ -43,3 +43,15 @@ class BillingConfig:
     payment_failure_grace_hours: int = 72
     paystack_cache_ttl_seconds: int = 300
     currency_default: str = "KES"
+
+    # Where THIS product's own pages live. Every product has a different
+    # dashboard URL, and the defaults below are Vett's - so Vett keeps
+    # working with no changes - but a product whose pages are elsewhere MUST
+    # set them or checkout redirects and every email button point at a URL
+    # that doesn't exist.
+    #
+    # Paths only (no query string): the router appends its own query
+    # parameters, e.g. "<checkout_success_path>?billing=success".
+    checkout_success_path: str = "/auth/login-page"      # after a successful checkout (absolute URL is built from app_base_url)
+    checkout_failure_path: str = "/dashboard/billing"    # after a failed/abandoned checkout
+    dashboard_path: str = "/dashboard/"                  # target of "Go to Dashboard" / "Re-subscribe" email buttons

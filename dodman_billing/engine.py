@@ -75,7 +75,7 @@ class BillingEngine:
         await self.emails.send(to, subject, html)
 
     def _dashboard_url(self) -> str:
-        return f"{self.config.app_base_url}/dashboard/"
+        return f"{self.config.app_base_url}{self.config.dashboard_path}"
 
     # ------------------------------------------------------------------
     # Subscribe / checkout
@@ -131,6 +131,13 @@ class BillingEngine:
         tx = data.get("data", {})
         if tx.get("status") != "success":
             return {"outcome": "failed", "reason": tx.get("status", "unknown")}
+    
+        plan_obj = tx.get("plan", {}) or {}
+        plan_code = plan_obj if isinstance(plan_obj, str) else plan_obj.get("plan_code", "")
+        if plan_code and self.plans.get_by_code(plan_code) is None:
+            log.error("handle_callback: plan code %s is not one of product=%s's plans (ref=%s)",
+                      plan_code, self.config.product_slug, reference)
+            return {"outcome": "error", "reason": "unknown_plan"}
 
         customer = tx.get("customer", {}) or {}
         cust_email = (customer.get("email") or "").lower().strip()
@@ -156,6 +163,10 @@ class BillingEngine:
         tx_metadata = tx.get("metadata") or {}
 
         plan_code = plan_obj.get("plan_code", "")
+        if plan_code and self.plans.get_by_code(plan_code) is None:
+            log.warning("Ignoring transaction %s: plan code %s is not one of product=%s's plans.",
+                        tx.get("reference", ""), plan_code, self.config.product_slug)
+            return
         plan_key = self.plans.key_from_code(plan_code)
         period_start_str, period_end_str = resolve_period_dates(tx, sub, plan_obj)
 
@@ -207,21 +218,29 @@ class BillingEngine:
         expected = hmac.new(self.config.paystack_webhook_secret.encode(), body, "sha512").hexdigest()
         return hmac.compare_digest(expected, signature_header or "")
 
+    @staticmethod
+    def _plan_code_in(data: dict) -> str:
+        """Best-effort plan code from a webhook payload. Paystack puts it at
+        data.plan on charge/subscription events and at data.subscription.plan
+        on some others; either may be an object or a bare code string."""
+        plan = data.get("plan") or (data.get("subscription") or {}).get("plan") or {}
+        if isinstance(plan, str):
+            return plan
+        return plan.get("plan_code", "") if isinstance(plan, dict) else ""
+
     async def _event_belongs_to_this_product(self, data: dict) -> bool:
-        """Every product on a shared Paystack account can receive every other
-        product's webhook events (Paystack allows one webhook URL per
-        account). The original code only checked this for charge.success -
-        every other event type trusted whatever user the email happened to
-        resolve to. This checks it for every event type; when metadata is
-        missing (older events, or event types Paystack doesn't echo it on),
-        it falls back to product-scoped user resolution - and even then,
-        SubscriptionRepository's RLS means a match against the wrong
-        product's data is still structurally impossible, not just unlikely."""
         metadata = data.get("metadata") or {}
         product = metadata.get("product")
         if product:
             return product == self.config.product_slug
-        return True  # no metadata to check - fall through to email-resolution as the real filter
+
+        # No product tag. A plan code that isn't one of OURS means the event
+        # belongs to another product sharing this Paystack account.
+        plan_code = self._plan_code_in(data)
+        if plan_code:
+            return self.plans.get_by_code(plan_code) is not None
+
+        return True  # nothing to check - fall through to email resolution
 
     async def handle_webhook(self, body: bytes, signature_header: str) -> None:
         if not self.verify_webhook_signature(body, signature_header):

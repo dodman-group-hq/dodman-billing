@@ -94,11 +94,12 @@ def build_billing_router(*, engine: BillingEngine, get_current_user: Callable, v
     async def callback(trxref: str | None = None, reference: str | None = None) -> Response:
         ref = trxref or reference
         result = await engine.handle_callback(ref)
+        cfg = engine.config
         if result["outcome"] == "success":
-            return RedirectResponse(url=f"{engine.config.app_base_url}/auth/login-page?billing=success", status_code=303)
+            return RedirectResponse(url=f"{cfg.app_base_url}{cfg.checkout_success_path}?billing=success", status_code=303)
         if result["outcome"] == "failed":
-            return RedirectResponse(url=f"/dashboard/billing?status=failed&reason={result['reason']}")
-        return RedirectResponse(url=f"/dashboard/billing?status=error&reason={result['reason']}")
+            return RedirectResponse(url=f"{cfg.checkout_failure_path}?status=failed&reason={result['reason']}", status_code=303)
+        return RedirectResponse(url=f"{cfg.checkout_failure_path}?status=error&reason={result['reason']}", status_code=303)
 
     # ------------------------------------------------------------------
     @router.post("/webhook", include_in_schema=False)
