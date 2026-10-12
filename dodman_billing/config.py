@@ -52,6 +52,6 @@ class BillingConfig:
     #
     # Paths only (no query string): the router appends its own query
     # parameters, e.g. "<checkout_success_path>?billing=success".
-    checkout_success_path: str = "/auth/login-page"      # after a successful checkout (absolute URL is built from app_base_url)
+    checkout_success_path: str = "/dashboard/billing"      # after a successful checkout (customer sees a confirmation page)
     checkout_failure_path: str = "/dashboard/billing"    # after a failed/abandoned checkout
     dashboard_path: str = "/dashboard/"                  # target of "Go to Dashboard" / "Re-subscribe" email buttons
